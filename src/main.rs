@@ -122,7 +122,6 @@ struct AuthData {
 struct TokenData {
     access_token: String,
     account_id: String,
-    refresh_token: Option<String>,
 }
 
 struct ProxyServer {
@@ -206,7 +205,11 @@ impl ProxyServer {
         }
     }
 
-    fn build_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn build_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+        auth_override: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let mut request_builder = builder
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
@@ -224,11 +227,13 @@ impl ProxyServer {
             .header("originator", "codex_cli_rs")
             .header("session_id", Uuid::new_v4().to_string());
 
-        if let Some(token) = self.access_token() {
+        let resolved_token = auth_override
+            .and_then(parse_bearer_token)
+            .or_else(|| self.access_token())
+            .or_else(|| self.api_key());
+
+        if let Some(token) = resolved_token {
             request_builder = request_builder.header("Authorization", format!("Bearer {}", token));
-        } else if let Some(api_key) = self.api_key() {
-            request_builder =
-                request_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
         if let Some(account_id) = self.account_id() {
@@ -241,12 +246,14 @@ impl ProxyServer {
     async fn proxy_request(
         &self,
         chat_req: ChatCompletionsRequest,
+        auth_override: Option<String>,
     ) -> Result<ChatCompletionsResponse> {
         let responses_req = self.convert_chat_to_responses(&chat_req);
         let backend_response = self
             .build_headers(
                 self.client
                     .post("https://chatgpt.com/backend-api/codex/responses"),
+                auth_override.as_deref(),
             )
             .json(&responses_req)
             .send()
@@ -297,7 +304,11 @@ impl ProxyServer {
         })
     }
 
-    async fn proxy_request_stream(&self, chat_req: ChatCompletionsRequest) -> Result<String> {
+    async fn proxy_request_stream(
+        &self,
+        chat_req: ChatCompletionsRequest,
+        auth_override: Option<String>,
+    ) -> Result<String> {
         let mut responses_req = self.convert_chat_to_responses(&chat_req);
         responses_req.stream = true;
 
@@ -305,6 +316,7 @@ impl ProxyServer {
             .build_headers(
                 self.client
                     .post("https://chatgpt.com/backend-api/codex/responses"),
+                auth_override.as_deref(),
             )
             .json(&responses_req)
             .send()
@@ -328,6 +340,24 @@ impl ProxyServer {
         let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
         let chunks = build_sse_chunks(&completion_id, &chat_req.model, &response_text).await?;
         Ok(chunks)
+    }
+}
+
+fn parse_bearer_token(value: &str) -> Option<String> {
+    let token = value.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let token = token
+        .strip_prefix("Bearer ")
+        .or_else(|| token.strip_prefix("bearer "))
+        .unwrap_or(token)
+        .trim();
+
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -379,12 +409,87 @@ fn collect_text_values(value: &Value, out: &mut String) {
                     out.push_str(text);
                     out.push(' ');
                 }
-            }
-            for (_, v) in map.iter() {
-                collect_text_values(v, out);
+            } else {
+                for (k, v) in map.iter() {
+                    if k == "type" {
+                        continue;
+                    }
+                    collect_text_values(v, out);
+                }
             }
         }
         _ => {}
+    }
+}
+
+fn extract_text_from_event(event: &Value) -> Option<String> {
+    if let Some(delta) = event.get("delta") {
+        if let Some(text) = delta.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(map_delta) = delta.as_object() {
+            if let Some(text) = map_delta.get("text").and_then(Value::as_str) {
+                return Some(text.to_string());
+            }
+            if let Some(refusal) = map_delta.get("refusal").and_then(Value::as_str) {
+                return Some(refusal.to_string());
+            }
+        }
+    }
+
+    if let Some(text) = event.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+
+    match event.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta") => {
+            if let Some(map_delta) = event.get("delta").and_then(Value::as_object) {
+                if let Some(text) = map_delta.get("text").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        Some("response.output_text.done") => {
+            if let Some(item) = event.get("item").and_then(Value::as_object) {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        Some("response.output_item.done") => {
+            if let Some(item) = event.get("item") {
+                let mut text = String::new();
+                if let Some(content) = item.get("content") {
+                    collect_text_values(content, &mut text);
+                }
+                let out = text.trim();
+                if !out.is_empty() {
+                    return Some(out.to_string());
+                }
+            }
+        }
+        Some("response.completed") => {
+            if let Some(resp) = event.get("response") {
+                if let Some(output) = resp.get("output") {
+                    let mut text = String::new();
+                    collect_text_values(output, &mut text);
+                    let out = text.trim();
+                    if !out.is_empty() {
+                        return Some(out.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut text = String::new();
+    collect_text_values(event, &mut text);
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
@@ -434,12 +539,20 @@ fn extract_text_from_payload(payload: &str) -> String {
 
     if let Ok(root) = serde_json::from_str::<Value>(payload) {
         let mut out = String::new();
-        if let Some(output) = root.get("output") {
+        if let Some(response) = root.get("response") {
+            if let Some(output) = response.get("output") {
+                collect_text_values(output, &mut out);
+            } else {
+                collect_text_values(response, &mut out);
+            }
+        } else if let Some(output) = root.get("output") {
             collect_text_values(output, &mut out);
         } else {
             collect_text_values(&root, &mut out);
         }
+
         if let Some(item) = root.get("text").and_then(Value::as_str) {
+            out.push(' ');
             out.push_str(item);
         }
         return out.trim().to_string();
@@ -491,7 +604,9 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
         None,
     )?);
 
-    if payload.lines().count() == 1 && !payload.contains("\ndata:") {
+    let is_sse = payload.lines().any(|line| line.starts_with("data: "));
+
+    if !is_sse {
         // non-sse backend response fallback
         let text = extract_text_from_payload(payload);
         if !text.is_empty() {
@@ -509,46 +624,27 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
                 if json_data == "[DONE]" {
                     break;
                 }
-                if json_data.is_empty() {
+                if json_data.trim().is_empty() {
                     continue;
                 }
 
                 if let Ok(event) = serde_json::from_str::<Value>(json_data) {
-                    let mut event_text = String::new();
-                    let event_type = event.get("type").and_then(Value::as_str);
-                    if let Some(event_type) = event_type {
-                        if event_type == "response.failed" {
-                            continue;
-                        }
+                    if event.get("type").and_then(Value::as_str) == Some("response.failed") {
+                        continue;
                     }
 
-                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                        event_text.push_str(delta);
-                    } else if let Some(text) = event.get("text").and_then(Value::as_str) {
-                        event_text.push_str(text);
-                    } else if event_type == Some("response.output_item.done") {
-                        if let Some(item) = event.get("item") {
-                            if let Some(content) = item.get("content") {
-                                collect_text_values(content, &mut event_text);
-                            }
+                    if let Some(event_text) = extract_text_from_event(&event) {
+                        let event_text = event_text.trim();
+                        if !event_text.is_empty() {
+                            collected.push_str(event_text);
+                            chunks.push(build_json_chunk(
+                                completion_id,
+                                model,
+                                None,
+                                Some(&escape_sse_content(event_text)),
+                                None,
+                            )?);
                         }
-                    } else if event_type == Some("response.completed") {
-                        if let Some(resp) = event.get("response") {
-                            if let Some(output) = resp.get("output") {
-                                collect_text_values(output, &mut event_text);
-                            }
-                        }
-                    }
-
-                    if !event_text.trim().is_empty() {
-                        collected.push_str(event_text.trim());
-                        chunks.push(build_json_chunk(
-                            completion_id,
-                            model,
-                            None,
-                            Some(&escape_sse_content(&event_text)),
-                            None,
-                        )?);
                     }
                 }
             }
@@ -734,7 +830,12 @@ async fn universal_request_handler(
             };
 
             if chat_req.stream.unwrap_or(false) {
-                match proxy.proxy_request_stream(chat_req).await {
+                let auth_header = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+
+                match proxy.proxy_request_stream(chat_req, auth_header).await {
                     Ok(sse) => {
                         let reply =
                             warp::reply::with_header(sse, "content-type", "text/event-stream");
@@ -774,7 +875,12 @@ async fn universal_request_handler(
                     }
                 }
             } else {
-                match proxy.proxy_request(chat_req).await {
+                let auth_header = headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string());
+
+                match proxy.proxy_request(chat_req, auth_header).await {
                     Ok(response) => {
                         let reply = warp::reply::json(&response);
                         let reply =
@@ -823,5 +929,110 @@ impl Clone for ProxyServer {
                 tokens: self.auth_data.tokens.clone(),
             },
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bearer_token_supports_various_prefixes() {
+        assert_eq!(
+            parse_bearer_token("Bearer sk-test-123"),
+            Some("sk-test-123".to_string())
+        );
+        assert_eq!(
+            parse_bearer_token("bearer sk-test-456"),
+            Some("sk-test-456".to_string())
+        );
+        assert_eq!(
+            parse_bearer_token("  token-without-prefix  "),
+            Some("token-without-prefix".to_string())
+        );
+        assert_eq!(parse_bearer_token(""), None);
+        assert_eq!(parse_bearer_token("   "), None);
+    }
+
+    #[test]
+    fn flatten_chat_content_works_with_text_and_objects() {
+        let content = json!([
+            {"type": "text", "text": "hello"},
+            {"type": "text", "text": "world"},
+            "bye"
+        ]);
+        let flat = flatten_chat_content(&content);
+        assert_eq!(flat, "hello world bye");
+    }
+
+    #[test]
+    fn collect_text_values_output_text_does_not_duplicate_text() {
+        let raw = json!({
+            "type": "output_text",
+            "text": "hi",
+            "annotations": [
+                {
+                    "type": "url_citation",
+                    "url": "https://example.com"
+                }
+            ]
+        });
+
+        let mut out = String::new();
+        collect_text_values(&raw, &mut out);
+        assert_eq!(out.trim(), "hi");
+    }
+
+    #[test]
+    fn extract_text_from_event_handles_output_item_done_and_completed() {
+        let output_item_done = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "content": [
+                    {"type": "output_text", "text": "hello"},
+                    " world"
+                ]
+            }
+        });
+        let item_text = extract_text_from_event(&output_item_done).expect("text");
+        assert!(item_text.contains("hello"));
+
+        let output_text_delta = json!({
+            "type": "response.output_text.delta",
+            "delta": {
+                "text": "delta text"
+            }
+        });
+        assert_eq!(
+            extract_text_from_event(&output_text_delta).expect("text"),
+            "delta text"
+        );
+
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "done"}]}
+                ]
+            }
+        });
+        assert_eq!(extract_text_from_event(&completed).expect("text"), "done");
+    }
+
+    #[tokio::test]
+    async fn build_sse_chunks_handles_response_output_events() {
+        let payload = [
+            "data: {\"type\": \"response.output_text.delta\", \"delta\": {\"text\": \"Hello\"}}",
+            "data: {\"type\": \"response.output_item.done\", \"item\": {\"content\": [{\"type\":\"output_text\",\"text\":\" world\"}]}}",
+            "data: [DONE]",
+        ]
+        .join("\n");
+
+        let sse = build_sse_chunks("chatcmpl-test", "gpt-5", &payload)
+            .await
+            .expect("build sse");
+
+        assert!(sse.contains("Hello"));
+        assert!(sse.contains("world"));
+        assert!(sse.ends_with("data: [DONE]\n\n"));
     }
 }
