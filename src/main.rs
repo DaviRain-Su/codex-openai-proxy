@@ -248,10 +248,10 @@ System instructions:
             input,
             tools: chat_req.tools.clone().unwrap_or_default(),
             tool_choice: normalize_tool_choice(chat_req.tool_choice.clone()),
-            temperature: chat_req.temperature,
-            max_output_tokens: chat_req.max_tokens,
             parallel_tool_calls: false,
             reasoning: None,
+            temperature: None,
+            max_output_tokens: None,
             store: false,
             stream: false,
         }
