@@ -103,6 +103,7 @@ enum ResponseItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentItem {
     InputText { text: String },
+    OutputText { text: String },
 }
 
 #[derive(Deserialize, Debug)]
@@ -220,10 +221,15 @@ impl ProxyServer {
                 continue;
             }
 
+            let content_item = match msg.role.as_str() {
+                "assistant" => ContentItem::OutputText { text: content },
+                _ => ContentItem::InputText { text: content },
+            };
+
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role.clone(),
-                content: vec![ContentItem::InputText { text: content }],
+                content: vec![content_item],
             });
         }
 
@@ -1062,6 +1068,53 @@ mod tests {
         ]);
         let flat = flatten_chat_content(&content);
         assert_eq!(flat, "hello world bye");
+    }
+
+    #[test]
+    fn convert_chat_to_responses_uses_output_text_for_assistant_role() {
+        let auth_data = AuthData {
+            openai_api_key: None,
+            api_key: Some("sk-test".to_string()),
+            access_token: None,
+            account_id: None,
+            tokens: None,
+        };
+        let proxy = ProxyServer {
+            client: Client::new(),
+            auth_data,
+        };
+        let chat_req = ChatCompletionsRequest {
+            model: "gpt-5.3-codex-spark".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Value::String("reply in Chinese".to_string()),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("Hello".to_string()),
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let responses = proxy.convert_chat_to_responses(&chat_req);
+        match &responses.input[0] {
+            ResponseItem::Message { content, .. } => match &content[0] {
+                ContentItem::OutputText { text } => assert_eq!(text, "reply in Chinese"),
+                _ => panic!("assistant message should use OutputText"),
+            },
+        }
+        match &responses.input[1] {
+            ResponseItem::Message { content, .. } => match &content[0] {
+                ContentItem::InputText { text } => assert_eq!(text, "Hello"),
+                _ => panic!("user message should use InputText"),
+            },
+        }
     }
 
     #[test]
