@@ -240,8 +240,14 @@ impl ProxyServer {
             model: Self::normalize_responses_model(&chat_req.model).to_string(),
             instructions,
             input,
-            tools: chat_req.tools.clone().unwrap_or_default(),
-            tool_choice: normalize_tool_choice(chat_req.tool_choice.clone()),
+            tools: sanitize_tools(chat_req.tools.clone()),
+            tool_choice: normalize_tool_choice(
+                chat_req.tool_choice.clone(),
+                chat_req
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| !tools.is_empty()),
+            ),
             parallel_tool_calls: false,
             reasoning: None,
             temperature: None,
@@ -431,6 +437,40 @@ fn parse_bearer_token(value: &str) -> Option<String> {
     }
 }
 
+fn sanitize_tools(tools: Option<Vec<Value>>) -> Vec<Value> {
+    let tools = tools.unwrap_or_default();
+    let mut cleaned = Vec::new();
+
+    for tool in tools {
+        let Some(object) = tool.as_object() else {
+            continue;
+        };
+
+        let has_name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty());
+
+        if !has_name {
+            continue;
+        }
+
+        let mut tool = tool;
+        if tool.get("type").is_none() {
+            if tool.get("input_schema").is_some() || tool.get("parameters").is_some() {
+                if let Some(mut object) = tool.as_object().cloned() {
+                    object.insert("type".to_string(), Value::String("function".to_string()));
+                    tool = Value::Object(object);
+                }
+            }
+        }
+
+        cleaned.push(tool);
+    }
+
+    cleaned
+}
+
 fn is_placeholder_token(token: &str) -> bool {
     let t = token.trim().to_lowercase();
     if t.len() < 10 {
@@ -446,7 +486,11 @@ fn is_placeholder_token(token: &str) -> bool {
         || t.contains(">")
 }
 
-fn normalize_tool_choice(tool_choice: Option<Value>) -> Option<Value> {
+fn normalize_tool_choice(tool_choice: Option<Value>, has_tools: bool) -> Option<Value> {
+    if !has_tools {
+        return None;
+    }
+
     tool_choice.or_else(|| Some(Value::String("auto".to_string())))
 }
 
@@ -1101,6 +1145,30 @@ mod tests {
         ]);
         let flat = flatten_chat_content(&content);
         assert_eq!(flat, "hello world bye");
+    }
+
+    #[test]
+    fn sanitize_tools_drops_invalid_tool_entries_without_name() {
+        let tools = vec![
+            json!({"type": "function", "name": "valid_fn", "description": "ok"}),
+            json!({"description": "missing name"}),
+            Value::String("weird".to_string()),
+            json!({"name": "inferred_function", "input_schema": {"type":"object"}}),
+        ];
+
+        let cleaned = sanitize_tools(Some(tools));
+        assert_eq!(cleaned.len(), 2);
+        assert!(cleaned
+            .iter()
+            .any(|t| t.get("name") == Some(&json!("valid_fn"))));
+        let inferred = cleaned
+            .iter()
+            .find(|t| t.get("name") == Some(&json!("inferred_function")))
+            .expect("inferred tool");
+        assert_eq!(
+            inferred.get("type").and_then(Value::as_str),
+            Some("function")
+        );
     }
 
     #[test]
