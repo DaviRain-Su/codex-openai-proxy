@@ -832,9 +832,19 @@ async fn universal_request_handler(
     proxy: ProxyServer,
 ) -> Result<impl Reply, warp::Rejection> {
     let path_str = path.as_str();
+    let normalized_path = path_str
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let normalized_path = if normalized_path.is_empty() {
+        "/"
+    } else {
+        normalized_path
+    };
     log_request(&method, path_str, &headers);
 
-    match (method.as_str(), path_str) {
+    match (method.as_str(), normalized_path) {
         ("GET", "/health") => Ok(warp::reply::json(
             &json!({"status": "ok", "service": "codex-openai-proxy"}),
         )
