@@ -208,9 +208,6 @@ impl ProxyServer {
     }
 
     fn convert_chat_to_responses(&self, chat_req: &ChatCompletionsRequest) -> ResponsesApiRequest {
-        let base_instructions =
-            "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.";
-
         let mut input = Vec::new();
         let mut system_messages = Vec::new();
 
@@ -221,7 +218,7 @@ impl ProxyServer {
                 continue;
             }
 
-            let content_item = match msg.role.as_str() {
+            let content_item = match msg.role.to_lowercase().as_str() {
                 "assistant" => ContentItem::OutputText { text: content },
                 _ => ContentItem::InputText { text: content },
             };
@@ -234,18 +231,9 @@ impl ProxyServer {
         }
 
         let instructions = if system_messages.is_empty() {
-            base_instructions.to_string()
+            String::new()
         } else {
-            format!(
-                "{base_instructions}
-
-System instructions:
-{}",
-                system_messages.join(
-                    "
-"
-                )
-            )
+            system_messages.join("\n")
         };
 
         ResponsesApiRequest {
@@ -487,6 +475,36 @@ fn flatten_chat_content(content: &Value) -> String {
     }
 }
 
+fn append_response_fragment(buffer: &mut String, fragment: &str) -> bool {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return false;
+    }
+
+    if buffer.is_empty() {
+        buffer.push_str(fragment);
+        return true;
+    }
+
+    if buffer.ends_with(fragment) {
+        return false;
+    }
+
+    if let Some(rest) = fragment.strip_prefix(buffer.as_str()) {
+        if !rest.is_empty() {
+            buffer.push_str(rest);
+        }
+        return !rest.is_empty();
+    }
+
+    if buffer.contains(fragment) {
+        return false;
+    }
+
+    buffer.push_str(fragment);
+    true
+}
+
 fn collect_text_values(value: &Value, out: &mut String) {
     match value {
         Value::String(s) => {
@@ -602,11 +620,16 @@ fn extract_text_from_payload(payload: &str) -> String {
                 }
                 if let Ok(event) = serde_json::from_str::<Value>(json_data) {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                        chunks.push(delta.to_string());
+                        let text = delta.trim();
+                        if !text.is_empty() && chunks.last().map_or(true, |last| last != &text) {
+                            chunks.push(delta.to_string());
+                        }
                         continue;
                     }
                     if let Some(text) = event.get("text").and_then(Value::as_str) {
-                        chunks.push(text.to_string());
+                        if !text.trim().is_empty() {
+                            chunks.push(text.to_string());
+                        }
                         continue;
                     }
                     if let Some(output) = event.get("response").and_then(Value::as_object) {
@@ -628,7 +651,10 @@ fn extract_text_from_payload(payload: &str) -> String {
             }
         }
 
-        let merged = chunks.join("");
+        let mut merged = String::new();
+        for chunk in chunks {
+            append_response_fragment(&mut merged, &chunk);
+        }
         if !merged.trim().is_empty() {
             return merged;
         }
@@ -726,14 +752,21 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
                 }
 
                 if let Ok(event) = serde_json::from_str::<Value>(json_data) {
-                    if event.get("type").and_then(Value::as_str) == Some("response.failed") {
-                        continue;
+                    if let Some(event_type) = event.get("type").and_then(Value::as_str) {
+                        if matches!(
+                            event_type,
+                            "response.failed"
+                                | "response.output_text.done"
+                                | "response.output_item.done"
+                                | "response.completed"
+                        ) {
+                            continue;
+                        }
                     }
 
                     if let Some(event_text) = extract_text_from_event(&event) {
                         let event_text = event_text.trim();
-                        if !event_text.is_empty() {
-                            collected.push_str(event_text);
+                        if append_response_fragment(&mut collected, event_text) {
                             chunks.push(build_json_chunk(
                                 completion_id,
                                 model,
@@ -1151,10 +1184,7 @@ mod tests {
 
         let responses = proxy.convert_chat_to_responses(&chat_req);
         assert_eq!(responses.model, "gpt-5");
-        assert!(responses.instructions.contains("System instructions"));
-        assert!(responses
-            .instructions
-            .contains("Always speak in one sentence."));
+        assert_eq!(responses.instructions, "Always speak in one sentence.");
         assert_eq!(responses.input.len(), 1);
         match &responses.input[0] {
             ResponseItem::Message { role, content, .. } => {
@@ -1249,7 +1279,7 @@ mod tests {
     async fn build_sse_chunks_handles_response_output_events() {
         let payload = [
             "data: {\"type\": \"response.output_text.delta\", \"delta\": {\"text\": \"Hello\"}}",
-            "data: {\"type\": \"response.output_item.done\", \"item\": {\"content\": [{\"type\":\"output_text\",\"text\":\" world\"}]}}",
+            "data: {\"type\": \"response.output_text.delta\", \"delta\": {\"text\": \" world\"}}",
             "data: [DONE]",
         ]
         .join("\n");
