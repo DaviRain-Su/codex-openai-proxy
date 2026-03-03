@@ -153,6 +153,31 @@ impl ProxyServer {
         Ok(Self { client, auth_data })
     }
 
+    fn supported_model_ids() -> Vec<&'static str> {
+        vec![
+            "gpt-4",
+            "gpt-5",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.2-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.2",
+            "gpt-5.1-codex-mini",
+        ]
+    }
+
+    fn normalize_responses_model(model: &str) -> &str {
+        match model {
+            "gpt-5.3-codex"
+            | "gpt-5.3-codex-spark"
+            | "gpt-5.2-codex"
+            | "gpt-5.1-codex-max"
+            | "gpt-5.2"
+            | "gpt-5.1-codex-mini" => "gpt-5",
+            _ => model,
+        }
+    }
+
     fn access_token(&self) -> Option<String> {
         if let Some(tokens) = &self.auth_data.tokens {
             return Some(tokens.access_token.clone());
@@ -195,7 +220,7 @@ impl ProxyServer {
         }
 
         ResponsesApiRequest {
-            model: chat_req.model.clone(),
+            model: Self::normalize_responses_model(&chat_req.model).to_string(),
             instructions: "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string(),
             input,
             tools: chat_req.tools.clone().unwrap_or_default(),
@@ -850,22 +875,21 @@ async fn universal_request_handler(
         )
         .into_response()),
         ("GET", "/models") | ("GET", "/v1/models") => {
+            let now = Utc::now().timestamp();
+            let models: Vec<Value> = ProxyServer::supported_model_ids()
+                .into_iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "openai"
+                    })
+                })
+                .collect();
             let models_response = json!({
                 "object": "list",
-                "data": [
-                    {
-                        "id": "gpt-4",
-                        "object": "model",
-                        "created": 1687882411,
-                        "owned_by": "openai"
-                    },
-                    {
-                        "id": "gpt-5",
-                        "object": "model",
-                        "created": 1687882411,
-                        "owned_by": "openai"
-                    }
-                ]
+                "data": models,
             });
             Ok(warp::reply::json(&models_response).into_response())
         }
@@ -1049,6 +1073,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_responses_model_aliases_gpt5_codex_variants_to_gpt5() {
+        assert_eq!(
+            ProxyServer::normalize_responses_model("gpt-5.3-codex"),
+            "gpt-5"
+        );
+        assert_eq!(
+            ProxyServer::normalize_responses_model("gpt-5.3-codex-spark"),
+            "gpt-5"
+        );
+        assert_eq!(ProxyServer::normalize_responses_model("gpt-5"), "gpt-5");
+        assert_eq!(ProxyServer::normalize_responses_model("gpt-4"), "gpt-4");
+    }
+
     fn extract_text_from_event_handles_output_item_done_and_completed() {
         let output_item_done = json!({
             "type": "response.output_item.done",
