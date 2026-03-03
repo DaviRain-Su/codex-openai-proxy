@@ -177,6 +177,10 @@ impl ProxyServer {
             .or_else(|| self.auth_data.api_key.clone())
     }
 
+    fn resolved_static_token(&self) -> Option<String> {
+        self.access_token().or_else(|| self.api_key())
+    }
+
     fn convert_chat_to_responses(&self, chat_req: &ChatCompletionsRequest) -> ResponsesApiRequest {
         let mut input = Vec::new();
 
@@ -227,8 +231,11 @@ impl ProxyServer {
             .header("originator", "codex_cli_rs")
             .header("session_id", Uuid::new_v4().to_string());
 
-        let resolved_token = auth_override
+        let resolved_override = auth_override
             .and_then(parse_bearer_token)
+            .filter(|token| !is_placeholder_token(token));
+
+        let resolved_token = resolved_override
             .or_else(|| self.access_token())
             .or_else(|| self.api_key());
 
@@ -243,6 +250,31 @@ impl ProxyServer {
         request_builder
     }
 
+    async fn request_response_body(
+        &self,
+        responses_req: &ResponsesApiRequest,
+        auth_override: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let backend_response = self
+            .build_headers(
+                self.client
+                    .post("https://chatgpt.com/backend-api/codex/responses"),
+                auth_override,
+            )
+            .json(responses_req)
+            .send()
+            .await
+            .context("Failed to send request to ChatGPT backend")?;
+
+        let status = backend_response.status();
+        let response_text = backend_response
+            .text()
+            .await
+            .context("Failed to read backend response")?;
+
+        Ok((status, response_text))
+    }
+
     async fn proxy_request(
         &self,
         chat_req: ChatCompletionsRequest,
@@ -253,22 +285,18 @@ impl ProxyServer {
         // Keep the API semantics to caller-side non-stream while requesting streamed backend payloads.
         responses_req.stream = true;
 
-        let backend_response = self
-            .build_headers(
-                self.client
-                    .post("https://chatgpt.com/backend-api/codex/responses"),
-                auth_override.as_deref(),
-            )
-            .json(&responses_req)
-            .send()
-            .await
-            .context("Failed to send request to ChatGPT backend")?;
+        let (status, response_text) = self
+            .request_response_body(&responses_req, auth_override.as_deref())
+            .await?;
 
-        let status = backend_response.status();
-        let response_text = backend_response
-            .text()
-            .await
-            .context("Failed to read backend response")?;
+        let (status, response_text) = if status == reqwest::StatusCode::UNAUTHORIZED
+            && auth_override.as_ref().is_some_and(|override_token| {
+                !is_placeholder_token(override_token) && self.resolved_static_token().is_some()
+            }) {
+            self.request_response_body(&responses_req, None).await?
+        } else {
+            (status, response_text)
+        };
 
         if !status.is_success() {
             return Err(anyhow::anyhow!(
@@ -316,22 +344,18 @@ impl ProxyServer {
         let mut responses_req = self.convert_chat_to_responses(&chat_req);
         responses_req.stream = true;
 
-        let backend_response = self
-            .build_headers(
-                self.client
-                    .post("https://chatgpt.com/backend-api/codex/responses"),
-                auth_override.as_deref(),
-            )
-            .json(&responses_req)
-            .send()
-            .await
-            .context("Failed to send request to ChatGPT backend")?;
+        let (status, response_text) = self
+            .request_response_body(&responses_req, auth_override.as_deref())
+            .await?;
 
-        let status = backend_response.status();
-        let response_text = backend_response
-            .text()
-            .await
-            .context("Failed to read backend response")?;
+        let (status, response_text) = if status == reqwest::StatusCode::UNAUTHORIZED
+            && auth_override.as_ref().is_some_and(|override_token| {
+                !is_placeholder_token(override_token) && self.resolved_static_token().is_some()
+            }) {
+            self.request_response_body(&responses_req, None).await?
+        } else {
+            (status, response_text)
+        };
 
         if !status.is_success() {
             return Err(anyhow::anyhow!(
@@ -363,6 +387,21 @@ fn parse_bearer_token(value: &str) -> Option<String> {
     } else {
         Some(token.to_string())
     }
+}
+
+fn is_placeholder_token(token: &str) -> bool {
+    let t = token.trim().to_lowercase();
+    if t.len() < 10 {
+        return true;
+    }
+
+    matches!(
+        t.as_str(),
+        "dummy" | "test" | "placeholder" | "xxxx" | "example" | "fake" | "none" | "null"
+    ) || t.contains("your")
+        || t.contains("replace")
+        || t.contains("<")
+        || t.contains(">")
 }
 
 fn normalize_tool_choice(tool_choice: Option<Value>) -> Option<Value> {
@@ -966,6 +1005,19 @@ mod tests {
         ]);
         let flat = flatten_chat_content(&content);
         assert_eq!(flat, "hello world bye");
+    }
+
+    #[test]
+    fn is_placeholder_token_rejects_too_short_and_dummy() {
+        assert!(is_placeholder_token("dummy"));
+        assert!(is_placeholder_token("   "));
+        assert!(is_placeholder_token("short"));
+        assert!(!is_placeholder_token(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example.longtoken"
+        ));
+        assert!(!is_placeholder_token(
+            "sk-very-long-actual-like-openai-token-1234567890"
+        ));
     }
 
     #[test]
