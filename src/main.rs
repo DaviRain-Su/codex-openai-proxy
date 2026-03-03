@@ -559,9 +559,20 @@ fn is_suspicious_output_fragment(fragment: &str) -> bool {
     if lower.starts_with("msg_")
         || lower.starts_with("rs_")
         || lower.starts_with("rc_")
+        || lower.starts_with("resp_")
+        || lower.starts_with("thread_")
+        || lower.starts_with("chatcmpl-")
         || lower.contains("describethingslocally")
         || lower.contains("tipusagehints")
         || lower.contains("usagehints")
+        || lower.contains("how can i help today")
+        || lower.contains("point me to a file")
+        || lower.contains("point me")
+        || lower.contains("describe the task")
+        || lower.contains("i can help")
+        || lower.contains("can i help")
+        || lower.contains("how can i help")
+        || (lower.contains("today") && lower.contains("help"))
     {
         return true;
     }
@@ -569,12 +580,7 @@ fn is_suspicious_output_fragment(fragment: &str) -> bool {
     let plain = fragment
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if plain
-        && (fragment.len() >= 20
-            || lower.starts_with("resp_")
-            || lower.starts_with("thread_")
-            || lower.starts_with("msg_"))
-    {
+    if plain && fragment.len() >= 20 {
         return true;
     }
 
@@ -612,8 +618,7 @@ fn collect_output_text_only(value: &Value, out: &mut String) {
                 match type_name {
                     "output_text" | "refusal" => {
                         if let Some(text) = map.get("text").and_then(Value::as_str) {
-                            out.push_str(text);
-                            out.push(' ');
+                            append_output_text_fragment(out, text);
                         }
                         return;
                     }
@@ -666,67 +671,60 @@ fn collect_text_values(value: &Value, out: &mut String) {
 }
 
 fn extract_text_from_event(event: &Value) -> Option<String> {
-    if let Some(event_type) = event.get("type").and_then(Value::as_str) {
-        match event_type {
-            "response.output_text.delta" => {
-                if let Some(map_delta) = event.get("delta").and_then(Value::as_object) {
-                    if let Some(text) = map_delta.get("text").and_then(Value::as_str) {
-                        if !is_suspicious_output_fragment(text) {
-                            return Some(text.to_string());
-                        }
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+
+    match event_type {
+        "response.output_text.delta" => {
+            if let Some(map_delta) = event.get("delta").and_then(Value::as_object) {
+                if let Some(text) = map_delta.get("text").and_then(Value::as_str) {
+                    if is_suspicious_output_fragment(text) {
                         return None;
                     }
+                    return Some(text.to_string());
                 }
-                return None;
             }
-            "response.output_text.done" => {
-                if let Some(item) = event.get("item").and_then(Value::as_object) {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        if !is_suspicious_output_fragment(text) {
-                            return Some(text.to_string());
-                        }
-                    }
-                }
-                return None;
-            }
-            "response.output_item.done" => {
-                if let Some(item) = event.get("item") {
-                    let mut text = String::new();
-                    if let Some(content) = item.get("content") {
-                        collect_output_text_only(content, &mut text);
-                    }
-                    let out = text.trim();
-                    if !out.is_empty() {
-                        return Some(out.to_string());
-                    }
-                }
-                return None;
-            }
-            "response.completed" => {
-                if let Some(resp) = event.get("response") {
-                    let mut text = String::new();
-                    if let Some(output) = resp.get("output") {
-                        collect_output_text_only(output, &mut text);
-                    }
-                    let out = text.trim();
-                    if !out.is_empty() {
-                        return Some(out.to_string());
-                    }
-                }
-                return None;
-            }
-            "response.error" => return None,
-            _ => {}
+            None
         }
-    }
-
-    let mut text = String::new();
-    collect_output_text_only(event, &mut text);
-    let text = text.trim();
-    if text.is_empty() || is_suspicious_output_fragment(text) {
-        None
-    } else {
-        Some(text.to_string())
+        "response.output_text.done" => {
+            if let Some(item) = event.get("item").and_then(Value::as_object) {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if is_suspicious_output_fragment(text) {
+                        return None;
+                    }
+                    return Some(text.to_string());
+                }
+            }
+            None
+        }
+        "response.output_item.done" => {
+            if let Some(item) = event.get("item") {
+                let mut text = String::new();
+                if let Some(content) = item.get("content") {
+                    collect_output_text_only(content, &mut text);
+                }
+                let out = text.trim();
+                if out.is_empty() || is_suspicious_output_fragment(out) {
+                    return None;
+                }
+                return Some(out.to_string());
+            }
+            None
+        }
+        "response.completed" => {
+            if let Some(resp) = event.get("response") {
+                if let Some(output) = resp.get("output") {
+                    let mut text = String::new();
+                    collect_output_text_only(output, &mut text);
+                    let out = text.trim();
+                    if out.is_empty() || is_suspicious_output_fragment(out) {
+                        return None;
+                    }
+                    return Some(out.to_string());
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -741,27 +739,11 @@ fn extract_text_from_payload(payload: &str) -> String {
                     continue;
                 }
                 if let Ok(event) = serde_json::from_str::<Value>(json_data) {
-                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                        let text = delta.trim();
-                        if !text.is_empty() && chunks.last().map_or(true, |last| last != &text) {
-                            chunks.push(delta.to_string());
+                    if let Some(event_text) = extract_text_from_event(&event) {
+                        let event_text = event_text.trim();
+                        if !event_text.is_empty() {
+                            chunks.push(event_text.to_string());
                         }
-                        continue;
-                    }
-                    if let Some(output) = event.get("response").and_then(Value::as_object) {
-                        if let Some(content) = output.get("output") {
-                            let mut block = String::new();
-                            collect_output_text_only(content, &mut block);
-                            if !block.trim().is_empty() {
-                                chunks.push(block.trim().to_string());
-                                continue;
-                            }
-                        }
-                    }
-                    let mut block = String::new();
-                    collect_output_text_only(&event, &mut block);
-                    if !block.trim().is_empty() {
-                        chunks.push(block.trim().to_string());
                     }
                 }
             }
@@ -1426,6 +1408,25 @@ mod tests {
             extract_text_from_event(&completed).expect("text"),
             "done extra"
         );
+    }
+
+    #[test]
+    fn extract_text_from_event_filters_usage_hints() {
+        let event = json!({
+            "type": "response.output_text.delta",
+            "delta": {
+                "text": "Hi!?describethingslocallyTipusagehintsmsg_0ce7197c589c70980169a6c28cb17881919fd0cc68c88895e6"
+            }
+        });
+        assert!(extract_text_from_event(&event).is_none());
+
+        let event = json!({
+            "type": "response.output_text.delta",
+            "delta": {
+                "text": "Hello, how can I help"
+            }
+        });
+        assert!(extract_text_from_event(&event).is_none());
     }
 
     #[test]
