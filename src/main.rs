@@ -207,21 +207,44 @@ impl ProxyServer {
     }
 
     fn convert_chat_to_responses(&self, chat_req: &ChatCompletionsRequest) -> ResponsesApiRequest {
+        let base_instructions =
+            "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.";
+
         let mut input = Vec::new();
+        let mut system_messages = Vec::new();
 
         for msg in &chat_req.messages {
+            let content = flatten_chat_content(&msg.content);
+            if msg.role.eq_ignore_ascii_case("system") {
+                system_messages.push(content);
+                continue;
+            }
+
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role.clone(),
-                content: vec![ContentItem::InputText {
-                    text: flatten_chat_content(&msg.content),
-                }],
+                content: vec![ContentItem::InputText { text: content }],
             });
         }
 
+        let instructions = if system_messages.is_empty() {
+            base_instructions.to_string()
+        } else {
+            format!(
+                "{base_instructions}
+
+System instructions:
+{}",
+                system_messages.join(
+                    "
+"
+                )
+            )
+        };
+
         ResponsesApiRequest {
             model: Self::normalize_responses_model(&chat_req.model).to_string(),
-            instructions: "You are a helpful AI assistant. Provide clear, accurate, and concise responses to user questions and requests.".to_string(),
+            instructions,
             input,
             tools: chat_req.tools.clone().unwrap_or_default(),
             tool_choice: normalize_tool_choice(chat_req.tool_choice.clone()),
@@ -1042,6 +1065,53 @@ mod tests {
     }
 
     #[test]
+    fn convert_chat_to_responses_moves_system_messages_into_instructions() {
+        let auth_data = AuthData {
+            openai_api_key: None,
+            api_key: Some("sk-test".to_string()),
+            access_token: None,
+            account_id: None,
+            tokens: None,
+        };
+        let proxy = ProxyServer {
+            client: Client::new(),
+            auth_data,
+        };
+        let chat_req = ChatCompletionsRequest {
+            model: "gpt-5.3-codex-spark".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Value::String("Always speak in one sentence.".to_string()),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Value::String("hello".to_string()),
+                },
+            ],
+            temperature: None,
+            max_tokens: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let responses = proxy.convert_chat_to_responses(&chat_req);
+        assert_eq!(responses.model, "gpt-5");
+        assert!(responses.instructions.contains("System instructions"));
+        assert!(responses
+            .instructions
+            .contains("Always speak in one sentence."));
+        assert_eq!(responses.input.len(), 1);
+        match &responses.input[0] {
+            ResponseItem::Message { role, content, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn is_placeholder_token_rejects_too_short_and_dummy() {
         assert!(is_placeholder_token("dummy"));
         assert!(is_placeholder_token("   "));
@@ -1086,6 +1156,7 @@ mod tests {
         assert_eq!(ProxyServer::normalize_responses_model("gpt-4"), "gpt-4");
     }
 
+    #[test]
     fn extract_text_from_event_handles_output_item_done_and_completed() {
         let output_item_done = json!({
             "type": "response.output_item.done",
