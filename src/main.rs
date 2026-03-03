@@ -609,16 +609,37 @@ fn collect_output_text_only(value: &Value, out: &mut String) {
                         }
                         return;
                     }
+                    "function_call" | "tool_use" | "tool_result" => {
+                        return;
+                    }
                     _ => {}
                 }
             }
 
-            for key in [
-                "content", "output", "item", "response", "delta", "input", "items", "value",
-            ] {
-                if let Some(value) = map.get(key) {
-                    collect_output_text_only(value, out);
+            for (key, nested) in map {
+                if matches!(
+                    key.as_str(),
+                    "type"
+                        | "id"
+                        | "name"
+                        | "role"
+                        | "status"
+                        | "created"
+                        | "finish_reason"
+                        | "model"
+                        | "error"
+                        | "code"
+                        | "thread_id"
+                        | "response_id"
+                        | "conversation_id"
+                        | "account_id"
+                        | "event_id"
+                        | "origin"
+                ) {
+                    continue;
                 }
+
+                collect_output_text_only(nested, out);
             }
         }
         _ => {}
@@ -754,25 +775,18 @@ fn extract_text_from_payload(payload: &str) -> String {
 
     if let Ok(root) = serde_json::from_str::<Value>(payload) {
         let mut out = String::new();
-        if let Some(response) = root.get("response") {
-            if let Some(output) = response.get("output") {
-                collect_output_text_only(output, &mut out);
-            } else {
-                collect_output_text_only(response, &mut out);
-            }
-        } else if let Some(output) = root.get("output") {
-            collect_output_text_only(output, &mut out);
-        } else {
-            collect_output_text_only(&root, &mut out);
-        }
+        collect_output_text_only(&root, &mut out);
 
         if let Some(item) = root.get("text").and_then(Value::as_str) {
             append_output_text_fragment(&mut out, item);
         }
-        return out.trim().to_string();
+        let out = out.trim().to_string();
+        if !out.is_empty() {
+            return out;
+        }
     }
 
-    String::new()
+    payload.to_string()
 }
 
 fn build_json_chunk(
@@ -886,11 +900,17 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
     }
 
     if !has_content {
+        let fallback = if extract_text_from_payload(payload).trim().is_empty() {
+            "没有解析到后端返回内容，请重试。".to_string()
+        } else {
+            extract_text_from_payload(payload)
+        };
+
         chunks.push(build_json_chunk(
             completion_id,
             model,
             None,
-            Some("没有解析到后端返回内容，请重试。"),
+            Some(&fallback),
             None,
         )?);
     }
