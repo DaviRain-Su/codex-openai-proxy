@@ -354,7 +354,10 @@ impl ProxyServer {
             ));
         }
 
-        let final_text = extract_text_from_payload(&response_text);
+        let mut final_text = extract_text_from_payload(&response_text);
+        if final_text.trim().is_empty() {
+            final_text = "没有解析到后端返回内容，请重试。".to_string();
+        }
 
         Ok(ChatCompletionsResponse {
             id: format!("chatcmpl-{}", Uuid::new_v4()),
@@ -728,6 +731,13 @@ fn extract_text_from_payload(payload: &str) -> String {
                         if !event_text.is_empty() {
                             chunks.push(event_text.to_string());
                         }
+                    } else {
+                        let mut raw = String::new();
+                        collect_output_text_only(&event, &mut raw);
+                        let raw = raw.trim();
+                        if !raw.is_empty() {
+                            chunks.push(raw.to_string());
+                        }
                     }
                 }
             }
@@ -746,19 +756,18 @@ fn extract_text_from_payload(payload: &str) -> String {
         let mut out = String::new();
         if let Some(response) = root.get("response") {
             if let Some(output) = response.get("output") {
-                collect_text_values(output, &mut out);
+                collect_output_text_only(output, &mut out);
             } else {
-                collect_text_values(response, &mut out);
+                collect_output_text_only(response, &mut out);
             }
         } else if let Some(output) = root.get("output") {
-            collect_text_values(output, &mut out);
+            collect_output_text_only(output, &mut out);
         } else {
-            collect_text_values(&root, &mut out);
+            collect_output_text_only(&root, &mut out);
         }
 
         if let Some(item) = root.get("text").and_then(Value::as_str) {
-            out.push(' ');
-            out.push_str(item);
+            append_output_text_fragment(&mut out, item);
         }
         return out.trim().to_string();
     }
@@ -800,6 +809,7 @@ fn build_json_chunk(
 async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Result<String> {
     let mut chunks: Vec<String> = Vec::new();
     let mut collected: String = String::new();
+    let mut has_content = false;
 
     chunks.push(build_json_chunk(
         completion_id,
@@ -815,6 +825,7 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
         // non-sse backend response fallback
         let text = extract_text_from_payload(payload);
         if !text.is_empty() {
+            has_content = true;
             chunks.push(build_json_chunk(
                 completion_id,
                 model,
@@ -835,13 +846,7 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
 
                 if let Ok(event) = serde_json::from_str::<Value>(json_data) {
                     if let Some(event_type) = event.get("type").and_then(Value::as_str) {
-                        if matches!(
-                            event_type,
-                            "response.failed"
-                                | "response.output_text.done"
-                                | "response.output_item.done"
-                                | "response.completed"
-                        ) {
+                        if matches!(event_type, "response.failed") {
                             continue;
                         }
                     }
@@ -849,6 +854,7 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
                     if let Some(event_text) = extract_text_from_event(&event) {
                         let event_text = event_text.trim();
                         if append_response_fragment(&mut collected, event_text) {
+                            has_content = true;
                             chunks.push(build_json_chunk(
                                 completion_id,
                                 model,
@@ -857,10 +863,36 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
                                 None,
                             )?);
                         }
+                    } else {
+                        let mut raw_text = String::new();
+                        collect_output_text_only(&event, &mut raw_text);
+                        let raw_text = raw_text.trim();
+                        if !raw_text.is_empty()
+                            && append_response_fragment(&mut collected, raw_text)
+                        {
+                            has_content = true;
+                            chunks.push(build_json_chunk(
+                                completion_id,
+                                model,
+                                None,
+                                Some(&escape_sse_content(raw_text)),
+                                None,
+                            )?);
+                        }
                     }
                 }
             }
         }
+    }
+
+    if !has_content {
+        chunks.push(build_json_chunk(
+            completion_id,
+            model,
+            None,
+            Some("没有解析到后端返回内容，请重试。"),
+            None,
+        )?);
     }
 
     chunks.push(build_json_chunk(
