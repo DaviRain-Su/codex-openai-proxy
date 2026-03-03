@@ -248,7 +248,11 @@ impl ProxyServer {
         chat_req: ChatCompletionsRequest,
         auth_override: Option<String>,
     ) -> Result<ChatCompletionsResponse> {
-        let responses_req = self.convert_chat_to_responses(&chat_req);
+        let mut responses_req = self.convert_chat_to_responses(&chat_req);
+        // ChatGPT Codex Responses endpoint appears to require stream=true in practice.
+        // Keep the API semantics to caller-side non-stream while requesting streamed backend payloads.
+        responses_req.stream = true;
+
         let backend_response = self
             .build_headers(
                 self.client
