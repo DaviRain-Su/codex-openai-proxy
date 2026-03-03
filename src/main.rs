@@ -354,14 +354,7 @@ impl ProxyServer {
             ));
         }
 
-        let content = extract_text_from_payload(&response_text);
-        let fallback = improved_response::generate_contextual_response(&chat_req.messages);
-
-        let final_text = if content.trim().is_empty() {
-            fallback
-        } else {
-            content
-        };
+        let final_text = extract_text_from_payload(&response_text);
 
         Ok(ChatCompletionsResponse {
             id: format!("chatcmpl-{}", Uuid::new_v4()),
@@ -565,14 +558,6 @@ fn is_suspicious_output_fragment(fragment: &str) -> bool {
         || lower.contains("describethingslocally")
         || lower.contains("tipusagehints")
         || lower.contains("usagehints")
-        || lower.contains("how can i help today")
-        || lower.contains("point me to a file")
-        || lower.contains("point me")
-        || lower.contains("describe the task")
-        || lower.contains("i can help")
-        || lower.contains("can i help")
-        || lower.contains("how can i help")
-        || (lower.contains("today") && lower.contains("help"))
     {
         return true;
     }
@@ -586,7 +571,6 @@ fn is_suspicious_output_fragment(fragment: &str) -> bool {
 
     false
 }
-
 fn append_output_text_fragment(out: &mut String, fragment: &str) {
     let fragment = fragment.trim();
     if is_suspicious_output_fragment(fragment) {
@@ -879,17 +863,6 @@ async fn build_sse_chunks(completion_id: &str, model: &str, payload: &str) -> Re
         }
     }
 
-    if collected.is_empty() {
-        let fallback = improved_response::generate_contextual_response(&[]);
-        chunks.push(build_json_chunk(
-            completion_id,
-            model,
-            None,
-            Some(&fallback),
-            None,
-        )?);
-    }
-
     chunks.push(build_json_chunk(
         completion_id,
         model,
@@ -1084,7 +1057,7 @@ async fn universal_request_handler(
                     }
                     Err(e) => {
                         println!("❌ Stream proxy error: {:#}", e);
-                        let fallback = improved_response::generate_contextual_response(&[]);
+                        let fallback = "Proxy request failed. Please retry.";
                         let chunk_id = format!("chatcmpl-{}", Uuid::new_v4());
                         let message_chunk = json!({
                             "id": chunk_id,
@@ -1410,20 +1383,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_text_from_event_filters_usage_hints() {
-        let event = json!({
-            "type": "response.output_text.delta",
-            "delta": {
-                "text": "Hi!?describethingslocallyTipusagehintsmsg_0ce7197c589c70980169a6c28cb17881919fd0cc68c88895e6"
-            }
-        });
-        assert!(extract_text_from_event(&event).is_none());
+    #[tokio::test]
+    async fn build_sse_chunks_with_unknown_events_does_not_use_contextual_fallback() {
+        let payload = [
+            "data: {\"type\": \"response.completed\", \"response\": {\"output\": []}}",
+            "data: [DONE]",
+        ]
+        .join(
+            "
+",
+        );
 
+        let sse = build_sse_chunks("chatcmpl-test", "gpt-5", &payload)
+            .await
+            .expect("build sse");
+
+        assert!(!sse.contains("I'm Claude"));
+        assert!(sse.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn extract_text_from_event_ignores_usage_hint_fragments() {
         let event = json!({
             "type": "response.output_text.delta",
             "delta": {
-                "text": "Hello, how can I help"
+                "text": "describethingslocallyTipusagehintsmsg_0ce7197c589c70980169a6c28cb17881919fd0cc68c88895e6"
             }
         });
         assert!(extract_text_from_event(&event).is_none());
