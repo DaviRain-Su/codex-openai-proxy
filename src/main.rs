@@ -549,6 +549,54 @@ fn append_response_fragment(buffer: &mut String, fragment: &str) -> bool {
     true
 }
 
+fn append_output_text_fragment(out: &mut String, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+
+    if !out.is_empty() && !out.ends_with(' ') {
+        out.push(' ');
+    }
+    out.push_str(fragment);
+}
+
+fn collect_output_text_only(value: &Value, out: &mut String) {
+    match value {
+        Value::String(s) => {
+            append_output_text_fragment(out, s);
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_output_text_only(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(type_name) = map.get("type").and_then(Value::as_str) {
+                match type_name {
+                    "output_text" | "refusal" => {
+                        if let Some(text) = map.get("text").and_then(Value::as_str) {
+                            out.push_str(text);
+                            out.push(' ');
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            for key in [
+                "content", "output", "item", "response", "delta", "input", "items", "value",
+            ] {
+                if let Some(value) = map.get(key) {
+                    collect_output_text_only(value, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_text_values(value: &Value, out: &mut String) {
     match value {
         Value::String(s) => {
@@ -631,7 +679,7 @@ fn extract_text_from_event(event: &Value) -> Option<String> {
             if let Some(resp) = event.get("response") {
                 if let Some(output) = resp.get("output") {
                     let mut text = String::new();
-                    collect_text_values(output, &mut text);
+                    collect_output_text_only(output, &mut text);
                     let out = text.trim();
                     if !out.is_empty() {
                         return Some(out.to_string());
@@ -679,7 +727,7 @@ fn extract_text_from_payload(payload: &str) -> String {
                     if let Some(output) = event.get("response").and_then(Value::as_object) {
                         if let Some(content) = output.get("output") {
                             let mut block = String::new();
-                            collect_text_values(content, &mut block);
+                            collect_output_text_only(content, &mut block);
                             if !block.trim().is_empty() {
                                 chunks.push(block.trim().to_string());
                                 continue;
@@ -687,7 +735,7 @@ fn extract_text_from_payload(payload: &str) -> String {
                         }
                     }
                     let mut block = String::new();
-                    collect_text_values(&event, &mut block);
+                    collect_output_text_only(&event, &mut block);
                     if !block.trim().is_empty() {
                         chunks.push(block.trim().to_string());
                     }
@@ -1335,12 +1383,25 @@ mod tests {
         let completed = json!({
             "type": "response.completed",
             "response": {
+                "id": "resp_xxx",
+                "status": "completed",
                 "output": [
-                    {"type": "message", "content": [{"type": "output_text", "text": "done"}]}
+                    {
+                        "type": "message",
+                        "id": "msg_08f3",
+                        "content": [
+                            {"type": "output_text", "text": "done"},
+                            " extra"
+                        ],
+                        "role": "assistant"
+                    }
                 ]
             }
         });
-        assert_eq!(extract_text_from_event(&completed).expect("text"), "done");
+        assert_eq!(
+            extract_text_from_event(&completed).expect("text"),
+            "done extra"
+        );
     }
 
     #[tokio::test]
