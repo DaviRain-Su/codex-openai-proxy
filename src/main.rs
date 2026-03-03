@@ -102,7 +102,7 @@ enum ResponseItem {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentItem {
-    InputText { text: String },
+    OutputText { text: String },
 }
 
 #[derive(Deserialize, Debug)]
@@ -223,7 +223,7 @@ impl ProxyServer {
             input.push(ResponseItem::Message {
                 id: None,
                 role: msg.role.clone(),
-                content: vec![ContentItem::InputText { text: content }],
+                content: vec![ContentItem::OutputText { text: content }],
             });
         }
 
